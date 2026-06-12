@@ -55,17 +55,11 @@ def run_core_scheduler_engine():
             machines.rename(columns={col: 'Machine Name'}, inplace=True)
             break
 
-    # =====================================================================
-    # OEE PERCENTAGE FORMAT STRIPPER (FIXES STRING TO FLOAT ERROR)
-    # =====================================================================
+    # OEE Percentage Format Stripper
     if 'OEE' in machines.columns:
-        # Convert to string to safely manipulate characters
         machines['OEE'] = machines['OEE'].astype(str).str.replace('%', '', regex=False).str.strip()
-        # Convert to raw numbers
         machines['OEE'] = pd.to_numeric(machines['OEE'], errors='coerce')
-        # If any user entered numbers as whole integers (e.g. 70 instead of 0.70), scale them back down
         machines['OEE'] = machines['OEE'].apply(lambda x: x / 100.0 if x > 1.0 else x)
-        # Fill empty values with a baseline 70% efficiency if a cell is left blank
         machines['OEE'] = machines['OEE'].fillna(0.70)
 
     calendar['Date'] = pd.to_datetime(calendar['Date'], errors='coerce')
@@ -106,7 +100,7 @@ def run_core_scheduler_engine():
     all_operational_tasks = []
 
     for idx, order in orders_processing.iterrows():
-        part_steps = routing[routing['Part No.'] == order['Part No.']].sort_values(by='Setup_Num')
+        part_steps = routing[routing['Part No.'] == order['Part No.'].strip()].sort_values(by='Setup_Num')
         total_part_cycle_time = sum([float(step[time_col])/float(step['Batch Size']) if float(step['Batch Size'])>0 else float(step[time_col]) for _, step in part_steps.iterrows()])
         
         for op_idx, (_, step) in enumerate(part_steps.iterrows()):
@@ -168,16 +162,16 @@ try:
 except Exception as e:
     st.error("❌ **Detailed Sheet Connection Breakdown**")
     st.code(str(e))
-    st.info("Look closely at the error message printed above to see exactly which worksheet name or configuration data cell is triggering the failure.")
+    st.info("Verify your Google Sheet configuration rows have clean values.")
     st.stop()
 
-# Header Formatting
-st.markdown("""
-    <div style="background-color:#1E293B; padding:20px; border-radius:10px; margin-bottom:25px;">
-        <h1 style="color:white; margin:0; font-family:'Segoe UI',sans-serif;">🏭 CNC SHOP FLOOR OPERATIONS CONTROL CENTER</h1>
-        <p style="color:#94A3B8; margin:5px 0 0 0;">Real-Time Finite Capacity Cross-Routing Scheduler Dashboard</p>
-    </div>
-""", unsafe_allowed_html=True)
+# =====================================================================
+# CLEAN NATIVE TITLE BLOCK (FIXES PYTHON 3.14 TYPEERROR)
+# =====================================================================
+# We use a clean string format completely native to the new Python 3.14 interpreter
+st.title("🏭 CNC SHOP FLOOR OPERATIONS CONTROL CENTER")
+st.caption("Real-Time Finite Capacity Cross-Routing Scheduler Dashboard")
+st.write("---")
 
 selected_view = st.sidebar.radio("Navigation Control Panel:", ["📊 Capacity Utilization Profile", "📦 Component Flow Roadmap", "📋 Executive Milestone Reports"])
 deadline_1, deadline_2 = pd.to_datetime('2026-06-25'), pd.to_datetime('2026-07-05')
