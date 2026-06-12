@@ -7,7 +7,7 @@ import plotly.express as px
 st.set_page_config(page_title="CNC Control Center", layout="wide")
 
 # =====================================================================
-# CONFIGURATION: LINKED DIRECTLY TO YOUR GOOGLE SHEET
+# CONFIGURATION: DIRECT CLOUD SYNCHRONIZATION LINK
 # =====================================================================
 NEW_SHEET_ID = "1iuFMQHJssHz4z0_zW-HQ6gMTAnQiRiqB6m2_hboiOFc"
 
@@ -35,7 +35,7 @@ def fetch_with_fallback(sheet_id, expected_name):
             
     raise ValueError(f"Could not find a valid tab named '{expected_name}' (or variations) in your Sheet.")
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=2)  # Low cache to render adjustments on the fly
 def run_core_scheduler_engine():
     orders = fetch_with_fallback(NEW_SHEET_ID, "Orders")
     routing = fetch_with_fallback(NEW_SHEET_ID, "RoutingMaster")
@@ -43,79 +43,115 @@ def run_core_scheduler_engine():
     calendar = fetch_with_fallback(NEW_SHEET_ID, "WorkingCalendar")
     maintenance = fetch_with_fallback(NEW_SHEET_ID, "Maintenance")
 
-    # Dynamic Column Name Normalization for Parts
+    # Column Mapping Alignments for Component/Part tracking lookups
     for df in [orders, routing]:
         if 'Part ID' in df.columns and 'Part No.' not in df.columns:
             df.rename(columns={'Part ID': 'Part No.'}, inplace=True)
 
-    # Dynamic Column Name Normalization for Machine Names
+    # Column Mapping Alignments for Machine Names 
     possible_name_cols = ['Machine Name', 'Machine', 'Description', 'Asset Name', 'Name']
     for col in possible_name_cols:
         if col in machines.columns and col != 'Machine Name':
             machines.rename(columns={col: 'Machine Name'}, inplace=True)
             break
 
-    # OEE Percentage Format Stripper
+    # OEE Text String to Float Processor
     if 'OEE' in machines.columns:
         machines['OEE'] = machines['OEE'].astype(str).str.replace('%', '', regex=False).str.strip()
         machines['OEE'] = pd.to_numeric(machines['OEE'], errors='coerce')
         machines['OEE'] = machines['OEE'].apply(lambda x: x / 100.0 if x > 1.0 else x)
         machines['OEE'] = machines['OEE'].fillna(0.70)
 
+    # Parse and safely isolate datetimes
     calendar['Date'] = pd.to_datetime(calendar['Date'], errors='coerce')
     maintenance['Start Date'] = pd.to_datetime(maintenance['Start Date'], errors='coerce')
     maintenance['End Date'] = pd.to_datetime(maintenance['End Date'], errors='coerce')
     orders['Due Date'] = pd.to_datetime(orders['Due Date'], errors='coerce')
     orders['Start Date'] = pd.to_datetime(orders['Start Date'], errors='coerce')
 
-    calendar = calendar[(calendar['Date'] >= pd.to_datetime('2026-06-06')) & (calendar['Date'] < pd.to_datetime('2026-07-06'))]
-    shop_dates = sorted(calendar['Date'].unique())
-    master_part_list = sorted(orders['Part No.'].unique())
-    master_machine_list = sorted(list(set(machines['Machine ID'].unique()).union(set(routing['Machine ID'].unique()))))
+    # =====================================================================
+    # FIX: AUTOMATED HORIZON DETECTOR (ELIMINATES BLANK/EMPTY GRAPHS)
+    # =====================================================================
+    # Instead of freezing hard boundaries to June/July 2026, we check your calendar rows
+    valid_calendar = calendar[calendar['Date'].notna()].sort_values('Date')
+    if valid_calendar.empty:
+        raise ValueError("The 'WorkingCalendar' tab doesn't have valid format datelines listed under a 'Date' column header.")
+        
+    shop_dates = sorted(valid_calendar['Date'].unique())
+    master_part_list = sorted(orders['Part No.'].dropna().unique())
+    master_machine_list = sorted(list(set(machines['Machine ID'].dropna().unique()).union(set(routing['Machine ID'].dropna().unique()))))
 
+    # Initialize Capacity Matrix Structures
     capacity_matrix = pd.DataFrame(0.0, index=master_machine_list, columns=shop_dates)
     baseline_capacities, total_available_shop_minutes = {}, {}
 
     for m_id in master_machine_list:
         mach_info = machines[machines['Machine ID'] == m_id]
-        daily_capacity = (int(mach_info['Shifts'].values[0]) * 8 * 60 * float(mach_info['OEE'].values[0])) if not mach_info.empty else (2 * 8 * 60 * 0.7)
+        shifts_val = int(mach_info['Shifts'].values[0]) if not mach_info.empty and 'Shifts' in mach_info.columns else 2
+        oee_val = float(mach_info['OEE'].values[0]) if not mach_info.empty and 'OEE' in mach_info.columns else 0.70
+        
+        daily_capacity = (shifts_val * 8 * 60 * oee_val)
         baseline_capacities[m_id] = daily_capacity
         total_minutes = 0.0
 
         for dt in shop_dates:
-            if calendar.loc[calendar['Date'] == dt, 'Working'].values[0] == 'N':
-                capacity_matrix.loc[m_id, dt] = -1.0
-                continue
+            # Check calendar tab to verify working windows
+            day_work_check = valid_calendar[valid_calendar['Date'] == dt]
+            if not day_work_check.empty and 'Working' in day_work_check.columns:
+                if str(day_work_check['Working'].values[0]).strip().upper() == 'N':
+                    capacity_matrix.loc[m_id, dt] = -1.0  # Weekend rest block
+                    continue
+                    
+            # Check preventive maintenance overlaps
             maint = maintenance[(maintenance['Machine ID'] == m_id) & (dt >= maintenance['Start Date']) & (dt <= maintenance['End Date'])]
             if not maint.empty:
-                capacity_matrix.loc[m_id, dt] = -2.0
+                capacity_matrix.loc[m_id, dt] = -2.0  # Down for PM service
                 continue
+                
             capacity_matrix.loc[m_id, dt] = daily_capacity
             total_minutes += daily_capacity
         total_available_shop_minutes[m_id] = total_minutes
 
-    routing['Setup_Num'] = routing['Setup No.'].str.extract(r'(\d+)').astype(int)
-    time_col = 'Time Per Part (min)' if 'Time Per Part (min)' in routing.columns else 'Time Per Part'
-    orders_processing = orders.sort_values(by=['Priority', 'Due Date']).copy()
+    # Build Setup sequences safely
+    if 'Setup No.' in routing.columns:
+        routing['Setup_Num'] = routing['Setup No.'].astype(str).str.extract(r'(\d+)').fillna(1).astype(int)
+    else:
+        routing['Setup_Num'] = 1
+
+    time_col = 'Time Per Part (min)' if 'Time Per Part (min)' in routing.columns else ('Time Per Part' if 'Time Per Part' in routing.columns else routing.columns[-1])
+    orders_processing = orders.dropna(subset=['Part No.', 'Qty']).sort_values(by=['Priority', 'Due Date']).copy()
     all_operational_tasks = []
 
     for idx, order in orders_processing.iterrows():
-        part_steps = routing[routing['Part No.'] == order['Part No.'].strip()].sort_values(by='Setup_Num')
-        total_part_cycle_time = sum([float(step[time_col])/float(step['Batch Size']) if float(step['Batch Size'])>0 else float(step[time_col]) for _, step in part_steps.iterrows()])
+        part_steps = routing[routing['Part No.'] == order['Part No.']].sort_values(by='Setup_Num')
+        if part_steps.empty:
+            continue
+            
+        total_part_cycle_time = sum([
+            float(step[time_col])/float(step['Batch Size']) if 'Batch Size' in step and float(step['Batch Size'])>0 else float(step[time_col]) 
+            for _, step in part_steps.iterrows()
+        ])
         
         for op_idx, (_, step) in enumerate(part_steps.iterrows()):
-            b_size = float(step['Batch Size']) if pd.notna(step['Batch Size']) and float(step['Batch Size'])>0 else 1.0
+            b_size = float(step['Batch Size']) if 'Batch Size' in step and pd.notna(step['Batch Size']) and float(step['Batch Size'])>0 else 1.0
             unit_time = float(step[time_col]) / b_size
+            
+            # Safe parsing for earliest release start triggers
+            rel_date = order['Start Date'] if 'Start Date' in order and pd.notna(order['Start Date']) else shop_dates[0]
+            
             all_operational_tasks.append({
                 'Job Index': idx, 'Order ID': order['Order ID'], 'Part No.': order['Part No.'],
-                'Part Name': order['Part Name'].strip(), 'Setup No.': step['Setup No.'],
-                'Setup Name': step['Setup Name'], 'Primary Machine ID': step['Machine ID'],
-                'Priority': order['Priority'], 'Due Date': order['Due Date'], 'Order Qty': order['Qty'],
-                'Op Index': op_idx, 'Unit Time': unit_time, 'Remaining Minutes to Schedule': order['Qty'] * unit_time,
-                'Is Final Op': (step['Setup No.'] == part_steps['Setup No.'].iloc[-1]),
-                'Total Part Cycle Time': total_part_cycle_time, 'Earliest Start Date': order['Start Date']
+                'Part Name': str(order['Part Name']).strip() if 'Part Name' in order else 'Part Component', 
+                'Setup No.': step['Setup No.'] if 'Setup No.' in step else f"Setup {op_idx+1}", 
+                'Setup Name': step['Setup Name'] if 'Setup Name' in step else 'Machining Op', 
+                'Primary Machine ID': step['Machine ID'], 'Priority': order['Priority'] if 'Priority' in order else 2, 
+                'Due Date': order['Due Date'], 'Order Qty': order['Qty'], 'Op Index': op_idx, 'Unit Time': unit_time, 
+                'Remaining Minutes to Schedule': order['Qty'] * unit_time,
+                'Is Final Op': (op_idx == len(part_steps) - 1), 'Total Part Cycle Time': total_part_cycle_time, 
+                'Earliest Start Date': pd.to_datetime(rel_date)
             })
 
+    # Machine Pool Groups
     interchangeable_groups = {
         'M001': ['M001', 'M002', 'M003'], 'M002': ['M001', 'M002', 'M003'], 'M003': ['M001', 'M002', 'M003'],
         'M005': ['M005', 'M006'], 'M006': ['M005', 'M006']
@@ -124,24 +160,31 @@ def run_core_scheduler_engine():
     scheduled_operations_log = []
     for current_date in shop_dates:
         active_pool = [t for t in all_operational_tasks if t['Remaining Minutes to Schedule'] > 0 and t['Earliest Start Date'] <= current_date]
-        if not active_pool: continue
+        if not active_pool: 
+            continue
         active_pool.sort(key=lambda x: (x['Priority'], x['Due Date'], x['Op Index']))
         
         for task in active_pool:
             primary_mach = task['Primary Machine ID']
             candidate_machines = interchangeable_groups.get(primary_mach, [primary_mach])
+            
             if task['Op Index'] > 0:
                 prev_task = [t for t in all_operational_tasks if t['Job Index'] == task['Job Index'] and t['Op Index'] == task['Op Index'] - 1][0]
-                if prev_task['Remaining Minutes to Schedule'] > 0: continue
+                if prev_task['Remaining Minutes to Schedule'] > 0: 
+                    continue
                     
             selected_mach, max_available_time = None, 0.0
             for mach in candidate_machines:
+                if mach not in capacity_matrix.index:
+                    continue
                 space_today = capacity_matrix.loc[mach, current_date]
                 if space_today > max_available_time:
                     max_available_time = space_today
                     selected_mach = mach
                     
-            if selected_mach is None or max_available_time <= 0: continue
+            if selected_mach is None or max_available_time <= 0: 
+                continue
+                
             minutes_to_allocate = min(task['Remaining Minutes to Schedule'], max_available_time)
             capacity_matrix.loc[selected_mach, current_date] -= minutes_to_allocate
             task['Remaining Minutes to Schedule'] -= minutes_to_allocate
@@ -156,27 +199,31 @@ def run_core_scheduler_engine():
 
     return pd.DataFrame(scheduled_operations_log), capacity_matrix, baseline_capacities, total_available_shop_minutes, shop_dates, master_part_list, master_machine_list, machines, orders_processing
 
-# Run Live App Data Load
+# Run Simulation Data Core
 try:
     schedule_df, capacity_matrix, baseline_capacities, total_available_shop_minutes, shop_dates, master_part_list, master_machine_list, machines_master, orders_processing = run_core_scheduler_engine()
 except Exception as e:
     st.error("❌ **Detailed Sheet Connection Breakdown**")
     st.code(str(e))
-    st.info("Verify your Google Sheet configuration rows have clean values.")
+    st.info("Look closely at the row layouts or parsing errors printed above to locate formatting glitches inside your cells.")
     st.stop()
 
-# =====================================================================
-# CLEAN NATIVE TITLE BLOCK (FIXES PYTHON 3.14 TYPEERROR)
-# =====================================================================
-# We use a clean string format completely native to the new Python 3.14 interpreter
+# Base Dashboard Headers
 st.title("🏭 CNC SHOP FLOOR OPERATIONS CONTROL CENTER")
-st.caption("Real-Time Finite Capacity Cross-Routing Scheduler Dashboard")
+st.caption("Live Cloud-Controlled Finite Capacity Shop Floor Scheduler Platform")
 st.write("---")
 
 selected_view = st.sidebar.radio("Navigation Control Panel:", ["📊 Capacity Utilization Profile", "📦 Component Flow Roadmap", "📋 Executive Milestone Reports"])
-deadline_1, deadline_2 = pd.to_datetime('2026-06-25'), pd.to_datetime('2026-07-05')
 
-# VIEW 1: MACHINE CAPACITY BAR CHART
+# Locate milestone check dates safely based on the sheet data boundaries
+if len(shop_dates) > 0:
+    midpoint_idx = len(shop_dates) // 2
+    deadline_1 = shop_dates[min(midpoint_idx, len(shop_dates)-1)]
+    deadline_2 = shop_dates[-1]
+else:
+    deadline_1, deadline_2 = pd.to_datetime('2026-06-25'), pd.to_datetime('2026-07-05')
+
+# VIEW 1: MACHINE UTILIZATION PROFILES
 if selected_view == "📊 Capacity Utilization Profile":
     st.subheader("📊 Post-Optimization Machine Load Profiles")
     balanced_load_data = []
@@ -197,60 +244,67 @@ if selected_view == "📊 Capacity Utilization Profile":
         })
     
     df_load = pd.DataFrame(balanced_load_data)
-    fig_load = px.bar(df_load, x='Machine ID', y='Utilization (%)', text='Utilization (%)', color='Utilization (%)',
-        custom_data=['Machine Name', 'Workload (Hrs)', 'Capacity (Hrs)'], color_continuous_scale='YlOrRd')
-    fig_load.update_traces(texttemplate='%{text}%', textposition='outside',
-        hovertemplate="<b>Machine ID:</b> %{x}<br><b>Name:</b> %{customdata[0]}<br><b>Scheduled:</b> %{customdata[1]} Hrs<br><b>Capacity:</b> %{customdata[2]} Hrs<extra></extra>")
-    fig_load.add_hline(y=100.0, line_dash="dash", line_color="red")
-    fig_load.update_layout(yaxis=dict(tickmode='linear', dtick=10, range=[0, max(df_load['Utilization (%)'].max()+15, 120)]), template="plotly_white")
-    st.plotly_chart(fig_load, use_container_width=True)
+    if not df_load.empty:
+        fig_load = px.bar(df_load, x='Machine ID', y='Utilization (%)', text='Utilization (%)', color='Utilization (%)',
+            custom_data=['Machine Name', 'Workload (Hrs)', 'Capacity (Hrs)'], color_continuous_scale='YlOrRd')
+        fig_load.update_traces(texttemplate='%{text}%', textposition='outside',
+            hovertemplate="<b>Machine ID:</b> %{x}<br><b>Name:</b> %{customdata[0]}<br><b>Scheduled:</b> %{customdata[1]} Hrs<br><b>Capacity:</b> %{customdata[2]} Hrs<extra></extra>")
+        fig_load.add_hline(y=100.0, line_dash="dash", line_color="red")
+        fig_load.update_layout(yaxis=dict(range=[0, max(df_load['Utilization (%)'].max()+20, 120)]), template="plotly_white")
+        st.plotly_chart(fig_load, use_container_width=True)
+    else:
+        st.warning("No active machine metrics were mapped out. Check your MachineMaster sheet values.")
 
-# VIEW 2: PRODUCT ROADMAP HEATMAP
+# VIEW 2: LOGISTICS HEATMAP
 elif selected_view == "📦 Component Flow Roadmap":
     st.subheader("📦 Component Delivery Tracking Channels")
-    color_grid_part = np.zeros((len(master_part_list), len(shop_dates)))
-    hover_text_part = np.empty((len(master_part_list), len(shop_dates)), dtype=object)
-    date_labels = [d.strftime('%b-%d') for d in shop_dates]
+    if not schedule_df.empty and len(master_part_list) > 0:
+        color_grid_part = np.zeros((len(master_part_list), len(shop_dates)))
+        hover_text_part = np.empty((len(master_part_list), len(shop_dates)), dtype=object)
+        date_labels = [d.strftime('%b-%d') for d in shop_dates]
 
-    for idx, p_no in enumerate(master_part_list):
-        matched_orders = orders_processing[orders_processing['Part No.'] == p_no]
-        for jdx, dt in enumerate(shop_dates):
-            if dt.weekday() == 6:
-                color_grid_part[idx, jdx] = -1
-                hover_text_part[idx, jdx] = "Sunday Rest Window"
-                continue
-            day_jobs = schedule_df[(schedule_df['Part No.'] == p_no) & (schedule_df['Scheduled Date'] == dt)]
-            past_and_today = schedule_df[(schedule_df['Part No.'] == p_no) & (schedule_df['Scheduled Date'] <= dt)]
-            target_qty = int(matched_orders[matched_orders['Due Date'] <= deadline_1]['Qty'].sum()) if dt <= deadline_1 else int(matched_orders['Qty'].sum())
-            finished = min(target_qty, past_and_today['Minutes Allocated'].sum() / past_and_today['Total Part Cycle Time'].iloc[0]) if not past_and_today.empty else 0.0
-            color_grid_part[idx, jdx] = 1 if not day_jobs.empty else (0 if finished >= target_qty else 3)
-            hover_text_part[idx, jdx] = f"Part No: {p_no}<br>Yield Status: {finished:.1f} / {target_qty} Total Pieces Scheduled"
+        for idx, p_no in enumerate(master_part_list):
+            matched_orders = orders_processing[orders_processing['Part No.'] == p_no]
+            for jdx, dt in enumerate(shop_dates):
+                day_jobs = schedule_df[(schedule_df['Part No.'] == p_no) & (schedule_df['Scheduled Date'] == dt)]
+                past_and_today = schedule_df[(schedule_df['Part No.'] == p_no) & (schedule_df['Scheduled Date'] <= dt)]
+                target_qty = int(matched_orders['Qty'].sum())
+                finished = min(target_qty, past_and_today['Minutes Allocated'].sum() / past_and_today['Total Part Cycle Time'].iloc[0]) if not past_and_today.empty else 0.0
+                
+                color_grid_part[idx, jdx] = 1 if not day_jobs.empty else (0 if finished >= target_qty else 3)
+                hover_text_part[idx, jdx] = f"Part No: {p_no}<br>Yield Status: {finished:.1f} / {target_qty} Total Pieces Scheduled"
 
-    fig_part = go.Figure(data=go.Heatmap(z=color_grid_part, x=date_labels, y=master_part_list, text=hover_text_part, hoverinfo='text', colorscale=[[0.0,'#FFB4B4'], [0.25,'#5A646E'], [0.5,'#F58C00'], [1.0,'#FFE13B']], showscale=False, xgap=2, ygap=2))
-    st.plotly_chart(fig_part, use_container_width=True)
+        fig_part = go.Figure(data=go.Heatmap(z=color_grid_part, x=date_labels, y=master_part_list, text=hover_text_part, hoverinfo='text', colorscale=[[0.0,'#66BB6A'], [0.33,'#5A646E'], [0.66,'#F58C00'], [1.0,'#FFE13B']], showscale=False, xgap=2, ygap=2))
+        st.plotly_chart(fig_part, use_container_width=True)
+    else:
+        st.warning("No operational toolpaths or parts have allocated run times yet. Verify that your Order 'Part No.' match rows in your 'RoutingMaster' exactly.")
 
-# VIEW 3: SHIPMENT MANAGEMENT SUMMARY TABLES
+# VIEW 3: PERFORMANCE METRIC SUMMARY TABLES
 else:
     st.subheader("📋 Executive Performance & Milestone Outcomes")
     m1_summary, m2_summary = [], []
+    
+    st.info(f"Target shipping tracking windows dynamically calculated based on your active spreadsheet horizons. Milestone 1 Threshold: **{deadline_1.strftime('%B %d, %Y')}** | Milestone 2 Threshold: **{deadline_2.strftime('%B %d, %Y')}**")
+    
     for p in master_part_list:
-        p_name = orders_processing[orders_processing['Part No.'] == p]['Part Name'].iloc[0].strip()
+        p_name_lookup = orders_processing[orders_processing['Part No.'] == p]['Part Name']
+        p_name = p_name_lookup.iloc[0].strip() if not p_name_lookup.empty else "CNC Component"
         
-        # June 25 Metrics Extraction
+        # Threshold Check 1
         t1 = int(orders_processing[(orders_processing['Part No.'] == p) & (orders_processing['Due Date'] <= deadline_1)]['Qty'].sum())
         p_runs1 = schedule_df[(schedule_df['Part No.'] == p) & (schedule_df['Scheduled Date'] <= deadline_1)] if not schedule_df.empty else pd.DataFrame()
         comp1 = min(t1, p_runs1['Minutes Allocated'].sum() / p_runs1['Total Part Cycle Time'].iloc[0]) if not p_runs1.empty else 0.0
         sf1 = max(0, t1-int(round(comp1)))
         m1_summary.append({'Part ID': p, 'Part Name': p_name, 'Target Order Qty': f"{t1} pcs", 'Scheduled Output': f"{int(round(comp1))} pcs", 'Shortfall Carryover': f"{sf1} pcs", 'Status': '✅ ON-TRACK' if sf1==0 else '⚠️ SHORTFALL'})
         
-        # July 5 Metrics Extraction
+        # Threshold Check 2
         t2 = int(orders_processing[(orders_processing['Part No.'] == p) & (orders_processing['Due Date'] <= deadline_2)]['Qty'].sum())
         p_runs2 = schedule_df[(schedule_df['Part No.'] == p) & (schedule_df['Scheduled Date'] <= deadline_2)] if not schedule_df.empty else pd.DataFrame()
         comp2 = min(t2, p_runs2['Minutes Allocated'].sum() / p_runs2['Total Part Cycle Time'].iloc[0]) if not p_runs2.empty else 0.0
         sf2 = max(0, t2-int(round(comp2)))
         m2_summary.append({'Part ID': p, 'Part Name': p_name, 'Target Order Qty': f"{t2} pcs", 'Scheduled Output': f"{int(round(comp2))} pcs", 'Shortfall Carryover': f"{sf2} pcs", 'Status': '✅ ON-TRACK' if sf2==0 else '⚠️ SHORTFALL'})
 
-    st.markdown("### 🔵 June 25th Shipping Milestone Delivery Table")
+    st.markdown(f"### 🔵 Milestone Phase 1 Progress Review ({deadline_1.strftime('%b %d')})")
     st.dataframe(pd.DataFrame(m1_summary), use_container_width=True, hide_index=True)
-    st.markdown("### 🟢 July 5th Consolidated Milestone Delivery Table")
+    st.markdown(f"### 🟢 Milestone Phase 2 Final Consolidation Review ({deadline_2.strftime('%b %d')})")
     st.dataframe(pd.DataFrame(m2_summary), use_container_width=True, hide_index=True)
