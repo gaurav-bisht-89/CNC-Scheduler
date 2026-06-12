@@ -11,32 +11,58 @@ st.set_page_config(page_title="CNC Control Center", layout="wide")
 # =====================================================================
 NEW_SHEET_ID = "1iuFMQHJssHz4z0_zW-HQ6gMTAnQiRiqB6m2_hboiOFc"
 
-@st.cache_data(ttl=5) # Checks for sheet updates every 5 seconds
-def load_clean_cloud_data(sheet_id, sheet_name):
-    csv_url = f"https://docs.google.com/spreadsheets/d/1iuFMQHJssHz4z0_zW-HQ6gMTAnQiRiqB6m2_hboiOFc/edit?usp=sharing"
-    df = pd.read_csv(csv_url)
+def fetch_with_fallback(sheet_id, expected_name):
+    """
+    Tries to pull data from a tab. If it fails, it tries variations like lowercase
+    or adding spaces to ensure the app doesn't crash on simple typos.
+    """
+    variations = [
+        expected_name,
+        expected_name.lower(),
+        expected_name.upper(),
+        expected_name.replace("Master", " Master").replace("Calendar", " Calendar")
+    ]
     
-    # Strip hidden whitespaces from columns and row data strings
-    df.columns = df.columns.str.strip()
-    for col in df.select_dtypes(include='object').columns:
-        df[col] = df[col].str.strip()
-    return df
+    last_error = None
+    for name in variations:
+        try:
+            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={name}"
+            df = pd.read_csv(csv_url)
+            if df.empty:
+                continue
+            
+            # Clean up column spaces and row data strings immediately
+            df.columns = df.columns.str.strip()
+            for col in df.select_dtypes(include='object').columns:
+                df[col] = df[col].str.strip()
+            return df
+        except Exception as e:
+            last_error = e
+            continue
+            
+    # If all variations fail, raise the original error for debugging
+    raise ValueError(f"Could not find a valid tab named '{expected_name}' (or variations) in your Sheet. Please check your tab name spelling.")
 
 @st.cache_data(ttl=5)
 def run_core_scheduler_engine():
-    orders = load_clean_cloud_data(NEW_SHEET_ID, "Orders")
-    routing = load_clean_cloud_data(NEW_SHEET_ID, "RoutingMaster")
-    machines = load_clean_cloud_data(NEW_SHEET_ID, "MachineMaster")
-    calendar = load_clean_cloud_data(NEW_SHEET_ID, "WorkingCalendar")
-    maintenance = load_clean_cloud_data(NEW_SHEET_ID, "Maintenance")
+    # Safely pull sheets even if they have minor spacing or casing discrepancies
+    orders = fetch_with_fallback(NEW_SHEET_ID, "Orders")
+    routing = fetch_with_fallback(NEW_SHEET_ID, "RoutingMaster")
+    machines = fetch_with_fallback(NEW_SHEET_ID, "MachineMaster")
+    calendar = fetch_with_fallback(NEW_SHEET_ID, "WorkingCalendar")
+    maintenance = fetch_with_fallback(NEW_SHEET_ID, "Maintenance")
 
-    # =====================================================================
-    # DYNAMIC COLUMN NAME NORMALIZATION (FIXES KEYERROR: 'PART NO.')
-    # =====================================================================
-    # Checks if sheets use 'Part ID' and changes it to 'Part No.' in the background
+    # Dynamic Column Name Normalization for Parts
     for df in [orders, routing]:
         if 'Part ID' in df.columns and 'Part No.' not in df.columns:
             df.rename(columns={'Part ID': 'Part No.'}, inplace=True)
+
+    # Dynamic Column Name Normalization for Machine Names
+    possible_name_cols = ['Machine Name', 'Machine', 'Description', 'Asset Name', 'Name']
+    for col in possible_name_cols:
+        if col in machines.columns and col != 'Machine Name':
+            machines.rename(columns={col: 'Machine Name'}, inplace=True)
+            break
 
     calendar['Date'] = pd.to_datetime(calendar['Date'], errors='coerce')
     maintenance['Start Date'] = pd.to_datetime(maintenance['Start Date'], errors='coerce')
@@ -132,12 +158,12 @@ def run_core_scheduler_engine():
 
     return pd.DataFrame(scheduled_operations_log), capacity_matrix, baseline_capacities, total_available_shop_minutes, shop_dates, master_part_list, master_machine_list, machines, orders_processing
 
-# Run Engine
+# Run Engine Engine
 try:
     schedule_df, capacity_matrix, baseline_capacities, total_available_shop_minutes, shop_dates, master_part_list, master_machine_list, machines_master, orders_processing = run_core_scheduler_engine()
 except Exception as e:
     st.error(f"❌ **Cloud Sheet Syncing Error:** {e}")
-    st.info("Ensure all tabs (Orders, RoutingMaster, MachineMaster, WorkingCalendar, Maintenance) match the required configurations exactly.")
+    st.info("Please verify that your Google Sheet has all 5 required worksheets populated.")
     st.stop()
 
 # Header
@@ -159,10 +185,23 @@ if selected_view == "📊 Capacity Utilization Profile":
         actual_min = schedule_df[schedule_df['Machine ID'] == m_id]['Minutes Allocated'].sum() if not schedule_df.empty else 0.0
         available_min = total_available_shop_minutes.get(m_id, 0.0)
         true_util = (actual_min / available_min * 100) if available_min > 0 else 0.0
-        balanced_load_data.append({'Machine ID': m_id, 'Utilization (%)': round(true_util, 1)})
+        
+        if 'Machine Name' in machines_master.columns:
+            m_name_lookup = machines_master[machines_master['Machine ID'] == m_id]['Machine Name']
+            m_name = m_name_lookup.values[0] if not m_name_lookup.empty else m_id
+        else:
+            m_name = m_id
+            
+        balanced_load_data.append({
+            'Machine ID': m_id, 'Machine Name': m_name, 'Utilization (%)': round(true_util, 1),
+            'Workload (Hrs)': round(actual_min / 60, 1), 'Capacity (Hrs)': round(available_min / 60, 1)
+        })
     
     df_load = pd.DataFrame(balanced_load_data)
-    fig_load = px.bar(df_load, x='Machine ID', y='Utilization (%)', text='Utilization (%)', color='Utilization (%)', color_continuous_scale='YlOrRd')
+    fig_load = px.bar(df_load, x='Machine ID', y='Utilization (%)', text='Utilization (%)', color='Utilization (%)',
+        custom_data=['Machine Name', 'Workload (Hrs)', 'Capacity (Hrs)'], color_continuous_scale='YlOrRd')
+    fig_load.update_traces(texttemplate='%{text}%', textposition='outside',
+        hovertemplate="<b>Machine ID:</b> %{x}<br><b>Name:</b> %{customdata[0]}<br><b>Scheduled:</b> %{customdata[1]} Hrs<br><b>Capacity:</b> %{customdata[2]} Hrs<extra></extra>")
     fig_load.add_hline(y=100.0, line_dash="dash", line_color="red")
     fig_load.update_layout(yaxis=dict(tickmode='linear', dtick=10, range=[0, max(df_load['Utilization (%)'].max()+15, 120)]), template="plotly_white")
     st.plotly_chart(fig_load, use_container_width=True)
