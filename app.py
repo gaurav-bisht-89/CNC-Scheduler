@@ -12,10 +12,6 @@ st.set_page_config(page_title="CNC Control Center", layout="wide")
 NEW_SHEET_ID = "1iuFMQHJssHz4z0_zW-HQ6gMTAnQiRiqB6m2_hboiOFc"
 
 def fetch_with_fallback(sheet_id, expected_name):
-    """
-    Tries to pull data from a tab. If it fails, it tries variations like lowercase
-    or adding spaces to ensure the app doesn't crash on simple typos.
-    """
     variations = [
         expected_name,
         expected_name.lower(),
@@ -23,7 +19,6 @@ def fetch_with_fallback(sheet_id, expected_name):
         expected_name.replace("Master", " Master").replace("Calendar", " Calendar")
     ]
     
-    last_error = None
     for name in variations:
         try:
             csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={name}"
@@ -31,21 +26,17 @@ def fetch_with_fallback(sheet_id, expected_name):
             if df.empty:
                 continue
             
-            # Clean up column spaces and row data strings immediately
             df.columns = df.columns.str.strip()
             for col in df.select_dtypes(include='object').columns:
                 df[col] = df[col].str.strip()
             return df
-        except Exception as e:
-            last_error = e
+        except:
             continue
             
-    # If all variations fail, raise the original error for debugging
-    raise ValueError(f"Could not find a valid tab named '{expected_name}' (or variations) in your Sheet. Please check your tab name spelling.")
+    raise ValueError(f"Could not find a valid tab named '{expected_name}' (or variations) in your Sheet.")
 
 @st.cache_data(ttl=5)
 def run_core_scheduler_engine():
-    # Safely pull sheets even if they have minor spacing or casing discrepancies
     orders = fetch_with_fallback(NEW_SHEET_ID, "Orders")
     routing = fetch_with_fallback(NEW_SHEET_ID, "RoutingMaster")
     machines = fetch_with_fallback(NEW_SHEET_ID, "MachineMaster")
@@ -63,6 +54,19 @@ def run_core_scheduler_engine():
         if col in machines.columns and col != 'Machine Name':
             machines.rename(columns={col: 'Machine Name'}, inplace=True)
             break
+
+    # =====================================================================
+    # OEE PERCENTAGE FORMAT STRIPPER (FIXES STRING TO FLOAT ERROR)
+    # =====================================================================
+    if 'OEE' in machines.columns:
+        # Convert to string to safely manipulate characters
+        machines['OEE'] = machines['OEE'].astype(str).str.replace('%', '', regex=False).str.strip()
+        # Convert to raw numbers
+        machines['OEE'] = pd.to_numeric(machines['OEE'], errors='coerce')
+        # If any user entered numbers as whole integers (e.g. 70 instead of 0.70), scale them back down
+        machines['OEE'] = machines['OEE'].apply(lambda x: x / 100.0 if x > 1.0 else x)
+        # Fill empty values with a baseline 70% efficiency if a cell is left blank
+        machines['OEE'] = machines['OEE'].fillna(0.70)
 
     calendar['Date'] = pd.to_datetime(calendar['Date'], errors='coerce')
     maintenance['Start Date'] = pd.to_datetime(maintenance['Start Date'], errors='coerce')
@@ -158,15 +162,16 @@ def run_core_scheduler_engine():
 
     return pd.DataFrame(scheduled_operations_log), capacity_matrix, baseline_capacities, total_available_shop_minutes, shop_dates, master_part_list, master_machine_list, machines, orders_processing
 
-# Run Engine Engine
+# Run Live App Data Load
 try:
     schedule_df, capacity_matrix, baseline_capacities, total_available_shop_minutes, shop_dates, master_part_list, master_machine_list, machines_master, orders_processing = run_core_scheduler_engine()
 except Exception as e:
-    st.error(f"❌ **Cloud Sheet Syncing Error:** {e}")
-    st.info("Please verify that your Google Sheet has all 5 required worksheets populated.")
+    st.error("❌ **Detailed Sheet Connection Breakdown**")
+    st.code(str(e))
+    st.info("Look closely at the error message printed above to see exactly which worksheet name or configuration data cell is triggering the failure.")
     st.stop()
 
-# Header
+# Header Formatting
 st.markdown("""
     <div style="background-color:#1E293B; padding:20px; border-radius:10px; margin-bottom:25px;">
         <h1 style="color:white; margin:0; font-family:'Segoe UI',sans-serif;">🏭 CNC SHOP FLOOR OPERATIONS CONTROL CENTER</h1>
@@ -177,7 +182,7 @@ st.markdown("""
 selected_view = st.sidebar.radio("Navigation Control Panel:", ["📊 Capacity Utilization Profile", "📦 Component Flow Roadmap", "📋 Executive Milestone Reports"])
 deadline_1, deadline_2 = pd.to_datetime('2026-06-25'), pd.to_datetime('2026-07-05')
 
-# VIEW 1: BAR CHART
+# VIEW 1: MACHINE CAPACITY BAR CHART
 if selected_view == "📊 Capacity Utilization Profile":
     st.subheader("📊 Post-Optimization Machine Load Profiles")
     balanced_load_data = []
@@ -206,7 +211,7 @@ if selected_view == "📊 Capacity Utilization Profile":
     fig_load.update_layout(yaxis=dict(tickmode='linear', dtick=10, range=[0, max(df_load['Utilization (%)'].max()+15, 120)]), template="plotly_white")
     st.plotly_chart(fig_load, use_container_width=True)
 
-# VIEW 2: HEATMAP
+# VIEW 2: PRODUCT ROADMAP HEATMAP
 elif selected_view == "📦 Component Flow Roadmap":
     st.subheader("📦 Component Delivery Tracking Channels")
     color_grid_part = np.zeros((len(master_part_list), len(shop_dates)))
@@ -230,19 +235,21 @@ elif selected_view == "📦 Component Flow Roadmap":
     fig_part = go.Figure(data=go.Heatmap(z=color_grid_part, x=date_labels, y=master_part_list, text=hover_text_part, hoverinfo='text', colorscale=[[0.0,'#FFB4B4'], [0.25,'#5A646E'], [0.5,'#F58C00'], [1.0,'#FFE13B']], showscale=False, xgap=2, ygap=2))
     st.plotly_chart(fig_part, use_container_width=True)
 
-# VIEW 3: SUMMARY TABLES
+# VIEW 3: SHIPMENT MANAGEMENT SUMMARY TABLES
 else:
     st.subheader("📋 Executive Performance & Milestone Outcomes")
     m1_summary, m2_summary = [], []
     for p in master_part_list:
         p_name = orders_processing[orders_processing['Part No.'] == p]['Part Name'].iloc[0].strip()
         
+        # June 25 Metrics Extraction
         t1 = int(orders_processing[(orders_processing['Part No.'] == p) & (orders_processing['Due Date'] <= deadline_1)]['Qty'].sum())
         p_runs1 = schedule_df[(schedule_df['Part No.'] == p) & (schedule_df['Scheduled Date'] <= deadline_1)] if not schedule_df.empty else pd.DataFrame()
         comp1 = min(t1, p_runs1['Minutes Allocated'].sum() / p_runs1['Total Part Cycle Time'].iloc[0]) if not p_runs1.empty else 0.0
         sf1 = max(0, t1-int(round(comp1)))
         m1_summary.append({'Part ID': p, 'Part Name': p_name, 'Target Order Qty': f"{t1} pcs", 'Scheduled Output': f"{int(round(comp1))} pcs", 'Shortfall Carryover': f"{sf1} pcs", 'Status': '✅ ON-TRACK' if sf1==0 else '⚠️ SHORTFALL'})
         
+        # July 5 Metrics Extraction
         t2 = int(orders_processing[(orders_processing['Part No.'] == p) & (orders_processing['Due Date'] <= deadline_2)]['Qty'].sum())
         p_runs2 = schedule_df[(schedule_df['Part No.'] == p) & (schedule_df['Scheduled Date'] <= deadline_2)] if not schedule_df.empty else pd.DataFrame()
         comp2 = min(t2, p_runs2['Minutes Allocated'].sum() / p_runs2['Total Part Cycle Time'].iloc[0]) if not p_runs2.empty else 0.0
